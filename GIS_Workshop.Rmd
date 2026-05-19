@@ -1,0 +1,617 @@
+---
+title: "GIS Visualization and Analysis in R"
+author: "Tuğba Bozçağa"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(
+  cache = FALSE,
+  fig.width = 6,
+  fig.height = 4,
+  fig.align = "center",
+  results = "markup",
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+This tutorial benefited extensively from several other sources, including but not limited to [rspatial.org](http://www.rspatial.org/) and Nick Eubank's ([here](http://www.nickeubank.com/gis-in-r/)) and Justin de Benedictis-Kessner's ([here](https://scholar.harvard.edu/jdbk/teaching)) great online tutorials.
+
+This is the modernized 2026 version of the original 2019 workshop. It has been updated to use the current spatial R stack built around `sf` and `terra`, replacing the now-retired `sp`, `rgdal`, `rgeos`, and `maptools` packages. The pedagogy of the original tutorial is preserved; only the code has been brought up to date.
+
+You'll need to go to [this](https://github.com/tugbabozcaga/GIS-R-Tutorial) GitHub link to download the data used in the tutorial. The Rmd assumes the shapefiles and CSVs live in `data/BostonData/` relative to the Rmd's location.
+
+# Setup
+
+If you have not installed the packages used in this workshop, you can install them all at once with:
+
+```{r eval = FALSE}
+install.packages(c(
+  "sf", "terra", "tidyverse", "tmap", "spdep", "spatialreg",
+  "tidygeocoder", "ggmap", "RColorBrewer", "units", "knitr"
+))
+```
+
+Load the libraries we will use throughout the workshop:
+
+```{r}
+library(sf)
+library(terra)
+library(tidyverse)
+library(tmap)
+library(spdep)
+library(spatialreg)
+library(tidygeocoder)
+library(ggmap)
+library(RColorBrewer)
+library(units)
+```
+
+Some operations that require external APIs (Google Maps for basemaps, geocoding, driving distance) are kept as `eval = FALSE` code examples; instructions to enable them are provided where they appear.
+
+# How R Sees Spatial Data
+
+In this first section, we will understand how R thinks about spatial data and how to import and export spatial datasets. Modern R uses the `sf` (simple features) package for vector data, which treats spatial objects as ordinary data frames with a special `geometry` column. This is far simpler than the older `sp` framework.
+
+## Make Spatial Data Points
+
+We start with the most basic geometric object, points. Like regular data points in plots, each spatial point needs a pair of x-y coordinates. In `sf`, we can build a points object directly from a `data.frame` with `st_as_sf()`.
+
+```{r}
+plus.coordinates <- data.frame(
+  x = c(1.5, 1.75, 2.25, 2.5,   # horizontal
+        2,    2,    2,    2,    # vertical
+        2),                     # center
+  y = c(1.25, 1.25, 1.25, 1.25,
+        1.75, 1.5,  1,    0.75,
+        1.25)
+)
+first.points <- st_as_sf(plus.coordinates, coords = c("x", "y"))
+plot(st_geometry(first.points), pch = 16)
+```
+
+To understand how `R` sees these points, we can use the `print()` or `summary()` command, or query specific properties directly. `sf` objects show their geometry type, bounding box, CRS (Coordinate Reference System), number of features, and the attribute table all together.
+
+```{r}
+print(first.points)
+st_geometry_type(first.points, by_geometry = FALSE)
+st_bbox(first.points)
+st_is_longlat(first.points)    # NA: no CRS assigned yet
+st_crs(first.points)
+nrow(first.points)
+st_coordinates(first.points)
+```
+
+## Add Coordinate Reference Systems
+
+The object we created above is a simple *spatial* object for now. We can make this points object *geospatial*, or relate its coordinates to locations on the Earth, by adding a Coordinate Reference System (CRS). A CRS combines information about an object's geographic coordinate system (GCS) and its projection, if any.^[A Geographic Coordinate System (GCS) links coordinates to geographic locations using a particular spherical or spheroidal model of the Earth. A Projected Coordinate System (PCS) takes a GCS and projects it onto a two-dimensional surface. All geospatial objects will have a GCS, but not all will be projected.] The CRS of an `sf` object can be retrieved with `st_crs()`. An empty CRS means the object does not yet have one assigned. To check whether the object has unprojected longitude/latitude coordinates, use `st_is_longlat()`.
+
+```{r}
+st_is_longlat(first.points) # NA before a CRS is set
+```
+
+The CRS can be defined using the EPSG reference code for a coordinate system. We'll use the most common CRS, EPSG:4326, also known as WGS 84.^[WGS 84 is a Geographic Coordinate System. It is not projected. However, many Projected Coordinate Systems are based on WGS 84. You can find the EPSG reference number for almost any CRS at [spatialreference.org](https://spatialreference.org/).] In `sf`, you can simply pass the integer EPSG code.
+
+```{r}
+st_crs(first.points) <- 4326
+st_is_longlat(first.points)
+st_crs(first.points)
+```
+
+In the old `sp` framework we needed a separate `SpatialPointsDataFrame` to attach attributes to points. In `sf`, an `sf` object is *already* a data frame: you can attach attributes as ordinary columns.
+
+```{r}
+first.points$vars1 <- rnorm(9)
+first.points$vars2 <- 101:109
+first.points
+```
+
+If you start with a `data.frame` that contains longitude and latitude columns, you can construct an `sf` object directly with `st_as_sf(df, coords = c("lon", "lat"), crs = 4326)`. We'll use this method below.
+
+## Polygons
+
+In `sf`, polygons are built up from numeric matrices of vertex coordinates. A `POLYGON` geometry expects a closed ring (first and last row equal). We build geometries with `st_polygon()`, wrap them in a geometry column with `st_sfc()`, and finally combine geometries and attributes into an `sf` object with `st_sf()`.
+
+```{r}
+# build two triangles (note: closed rings -- the first point is repeated at the end)
+triangle1 <- st_polygon(list(rbind(c(1, 1), c(2, 1), c(1.5, 0), c(1, 1))))
+triangle2 <- st_polygon(list(rbind(c(1, 1), c(1.5, 2), c(2, 1), c(1, 1))))
+
+# wrap the geometries in a geometry column with a CRS
+triangles.geom <- st_sfc(triangle1, triangle2, crs = 4326)
+
+# attach attributes (rows align with geometries by position)
+first.polys <- st_sf(
+  id    = c("triangle1", "triangle2"),
+  attr1 = c(1, 2),
+  attr2 = c(6, 5),
+  geometry = triangles.geom
+)
+first.polys
+plot(first.polys["attr1"])
+```
+
+Since the CRS was already set when we called `st_sfc(..., crs = 4326)`, the polygons are geospatial: their coordinates are interpreted as longitude/latitude on the WGS84 datum.
+
+# Importing and Exporting Spatial Data
+
+Of course creating polygons by hand is not common. Instead we use existing spatial data by importing them from external sources. The most common data format is a shapefile (`.shp`).
+
+In `sf`, we read shapefiles with `st_read()`. We just give it the path to the `.shp` file -- it will automatically read the sidecar files (`.dbf`, `.prj`, `.shx`).
+
+```{r}
+boston <- st_read(file.path("data", "BostonData", "city_council_districts.shp"))
+```
+
+An `sf` object is a normal data frame with an extra `geometry` column. You can inspect it just like any other data frame.
+
+```{r}
+st_bbox(boston)
+head(st_coordinates(st_centroid(st_geometry(boston))))
+st_drop_geometry(boston)[1:5, ]
+st_crs(boston)
+```
+
+To export an `sf` object back out to a shapefile (or GeoPackage, GeoJSON, etc.), you would call `st_write(boston, "boston.shp")`.
+
+# Combining Spatial Data with Other Data Sources
+
+## Merging
+
+### Spatial + Non-Spatial
+
+Now we will learn how to merge a spatial object with tabular data, using a common unique identifier. First, load the elections tabular data.
+
+```{r}
+boston.elections <- read.csv(file.path("data", "BostonData", "dist_results.csv"))
+```
+
+Now we have i) an `sf` polygons object named `boston`, and ii) a `data.frame` called `boston.elections`, where *DISTRICT* is the unique identifier in `boston` and *District* is the unique identifier in `boston.elections`. Because an `sf` object is just a data frame, we can use ordinary `merge()` (or `dplyr::left_join()`).
+
+```{r}
+boston <- merge(boston, boston.elections,
+                by.x = "DISTRICT", by.y = "District")
+st_drop_geometry(boston)[1:5, ]
+```
+
+In the old `sp` world there was a warning that you should never merge the `@data` slot directly with another table because it could re-order rows and corrupt the link to the geometries. With `sf` this concern is gone: the geometry column travels with its row, so `merge()` and `left_join()` are safe.
+
+### Spatial + Spatial
+
+Before merging two spatial datasets, the first thing you need to do is to check whether they have the same CRS. Both files should agree on the correspondence between coordinate values and points on the Earth. If you try to combine two spatial objects with different CRSs, your results won't make much sense.
+
+If your objects don't have the same CRS, you'll need to reproject one of them. Reprojecting **changes** not just the metadata associated with an object but also **all the actual x and y coordinates**.
+
+You can re-project any vector object with `st_transform()`, which takes i) the object and ii) the EPSG code (or CRS object) you want it to take.
+
+```{r eval = FALSE}
+MyCity.reprojected <- st_transform(MyCity, 4326)
+```
+
+If you want to align one object's CRS with another's, pull the CRS out and pass it in:
+
+```{r eval = FALSE}
+MyCityA.reprojected <- st_transform(MyCityA, st_crs(MyCityB))
+```
+
+## Spatial Merges
+
+So far we have used a common unique identifier to merge, as with regular datasets. We can also merge using geographic location. Now we're going to work with Boston municipal service requests for graffiti removal.
+
+We know the geolocation of graffiti instances but not which district they are in. We will overlay the graffiti points on our Boston district polygons using `st_join()`. This is the modern replacement for the old `over()` function from `sp`.
+
+```{r}
+boston.requests <- read.csv(file.path("data", "BostonData", "graffiti.csv"))
+boston.graf <- st_as_sf(boston.requests,
+                        coords = c("LONGITUDE", "LATITUDE"),
+                        crs = 4326)
+```
+
+Next we make sure the Boston map has the same CRS as the points:
+
+```{r}
+boston <- st_transform(boston, 4326)
+```
+
+For every graffiti instance, we want to know which district it falls in. We use `st_join()` with `join = st_intersects`. The result is a new `sf` object that has each point's attributes plus the polygon attributes from the district it fell in.
+
+```{r}
+boston.graf.joined <- st_join(boston.graf, boston, join = st_intersects)
+st_drop_geometry(boston.graf.joined)[1:5, ]
+names(boston.graf.joined)
+```
+
+If you only need the index of the intersecting polygon (analogous to the old `over(points, geometry(polys))`), use `st_intersects()`:
+
+```{r}
+intersections <- st_intersects(boston.graf, boston)
+head(intersections)
+```
+
+# Making Maps
+
+## Making Maps with `plot()`
+
+Now that we've merged our spatial data with other data sources, we are ready to create maps. The base `plot()` method for `sf` objects gives you a quick look at your data. By default it creates one panel per attribute column, so often you'll want to plot just the geometry, or one column at a time.
+
+```{r}
+plot(st_geometry(boston))
+plot(st_geometry(boston.graf), col = "blue", cex = 0.5, pch = 16, add = TRUE)
+```
+
+Another useful approach is coloring the polygons based on the values in one of the attributes. For instance, since we have already merged the Boston districts with the election results, we can color the districts based on the margin of victory. These maps -- areas shaded in proportion to a statistical variable -- are called *choropleth maps*.
+
+The old workflow involved building color codes by hand with `classInt`, `RColorBrewer`, and `findColours()`. The modern `tmap` package handles classification, color palettes, and legends in one step:
+
+```{r}
+tm_shape(boston) +
+  tm_polygons("MOV",
+              style = "quantile",
+              n = 5,
+              palette = "Blues",
+              border.col = NA,
+              title = "MOV Quantile") +
+  tm_layout(legend.position = c("right", "bottom"),
+            legend.text.size = 0.6)
+```
+
+If you don't like this color scheme, simply swap in another palette from `RColorBrewer`. To see all the palettes, run:
+
+```{r eval = FALSE}
+RColorBrewer::display.brewer.all()
+```
+
+Here is the same map with a different palette:
+
+```{r}
+tm_shape(boston) +
+  tm_polygons("MOV",
+              style = "quantile",
+              n = 5,
+              palette = "BuPu",
+              border.col = NA,
+              title = "MOV Quantile") +
+  tm_layout(legend.position = c("right", "bottom"),
+            legend.text.size = 0.6)
+```
+
+We can also add district labels at polygon centroids. Use `st_centroid()` to compute centroids, then add a `tm_text()` layer (`tmap` issues a warning when computing centroids for longitude/latitude data, which we silence here).
+
+```{r}
+boston.centroids <- suppressWarnings(st_centroid(boston))
+
+tm_shape(boston) +
+  tm_polygons("MOV",
+              style = "quantile",
+              n = 5,
+              palette = "BuPu",
+              border.col = NA,
+              title = "MOV Quantile") +
+  tm_shape(boston.centroids) +
+  tm_text("DISTRICT", size = 0.7) +
+  tm_layout(legend.position = c("right", "bottom"),
+            legend.text.size = 0.6)
+```
+
+## Making Maps with `ggplot2` and `geom_sf`
+
+The modern replacement for `spplot()` is `ggplot2`'s `geom_sf()`, which understands `sf` objects natively. It is far cleaner than the old `fortify()` workflow: there is no need to "tidy" the polygons into vertices; we just hand the `sf` object to `geom_sf()`.
+
+```{r}
+ggplot(boston) +
+  geom_sf(aes(fill = MOV), color = "white") +
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       name = "Margin of Victory") +
+  ggtitle("Boston City Council Districts") +
+  theme_minimal()
+```
+
+We can layer points on top in exactly the same way -- another `geom_sf()`. This entirely replaces the old `fortify()` / `geom_polygon(aes(x = long, y = lat, group = group))` dance.
+
+```{r}
+ggplot() +
+  geom_sf(data = boston, aes(fill = MOV), color = "white", alpha = 0.6) +
+  geom_sf(data = boston.graf, color = "purple", size = 0.3) +
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       name = "Margin of Victory") +
+  theme_minimal()
+```
+
+We can also create a 2-D density surface for the graffiti points using `stat_density_2d()`. Because `stat_density_2d()` expects plain x/y columns, we extract them from the geometry first.
+
+```{r}
+graf.xy <- boston.graf %>%
+  mutate(LONGITUDE = st_coordinates(.)[, 1],
+         LATITUDE  = st_coordinates(.)[, 2]) %>%
+  st_drop_geometry()
+
+ggplot() +
+  geom_sf(data = boston, aes(fill = MOV), color = "white", alpha = 0.6) +
+  stat_density_2d(data = graf.xy,
+                  aes(x = LONGITUDE, y = LATITUDE, alpha = after_stat(level)),
+                  geom = "polygon", fill = "purple") +
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       name = "Margin of Victory") +
+  labs(alpha = "Service-request density") +
+  theme_minimal()
+```
+
+## Adding a Basemap with `ggmap`
+
+The `ggmap` package is convenient for combining a tiled basemap with `ggplot2` layers. Since 2018, Google has required an API key for its tile and geocoding services; Stamen tiles previously fetched directly through `ggmap` now also require a (free) Stadia Maps key. Because no key is bundled with this Rmd, the basemap example below is left as `eval = FALSE`. To run it locally:
+
+1. Sign up for a Stadia Maps key (or Google Maps Platform key).
+2. Store it in an environment variable, e.g. add `STADIA_MAPS_API_KEY=...` to your `.Renviron`.
+3. Register the key in R as shown below.
+
+**Do not hard-code your key in this Rmd.**
+
+```{r eval = FALSE}
+# Register your basemap key (read from environment, not hard-coded!)
+ggmap::register_stadiamaps(key = Sys.getenv("STADIA_MAPS_API_KEY"))
+# For Google basemaps / geocoding, use:
+# ggmap::register_google(key = Sys.getenv("GOOGLE_MAPS_API_KEY"))
+
+boston.bbox <- c(left = -71.20, bottom = 42.22,
+                 right = -70.99, top   = 42.40)
+g_toner <- get_stadiamap(bbox = boston.bbox, zoom = 12,
+                         maptype = "stamen_toner_lite")
+
+base_t <- ggmap(g_toner, extent = "device", legend = "none")
+base_t
+```
+
+Once you have a basemap object `base_t`, layering `sf` data on top is straightforward. Use `geom_sf(..., inherit.aes = FALSE)` so that `ggmap`'s coordinate system is preserved.
+
+```{r eval = FALSE}
+base_t +
+  geom_sf(data = boston,
+          aes(fill = MOV),
+          color = "white", alpha = 0.6,
+          inherit.aes = FALSE) +
+  geom_sf(data = boston.graf,
+          color = "purple", size = 0.4,
+          inherit.aes = FALSE) +
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       name = "Margin of Victory") +
+  coord_sf(crs = 4326)
+```
+
+# Location, Area, Distance Calculation Tools
+
+## Geocoding
+
+Geocoding is the process of converting addresses or place names into latitude/longitude coordinates. The modern, key-free option is `tidygeocoder::geocode()`, which by default uses OpenStreetMap's Nominatim service.
+
+```{r}
+places <- tibble(name = c("Muddy Charles, Cambridge, MA",
+                          "30 Wadsworth St, Cambridge, MA"))
+places.geo <- places %>%
+  geocode(address = name, method = "osm", lat = lat, long = lon)
+places.geo
+```
+
+You can also reverse-geocode -- ask for an address given a coordinate -- using `tidygeocoder::reverse_geocode()`:
+
+```{r}
+places.geo %>%
+  reverse_geocode(lat = lat, long = lon, method = "osm",
+                  address = matched_address)
+```
+
+For finer-grained results (e.g. Google's `loctype` precision categories, or driving-time/distance queries), you can still use the Google Maps API through `ggmap::geocode()` / `ggmap::mapdist()`. These require a Google API key. The example below is left as `eval = FALSE`; set `GOOGLE_MAPS_API_KEY` in your `.Renviron` and call `ggmap::register_google(key = Sys.getenv("GOOGLE_MAPS_API_KEY"))` to enable it.
+
+```{r eval = FALSE}
+# ggmap::register_google(key = Sys.getenv("GOOGLE_MAPS_API_KEY"))
+pub    <- "Muddy Charles, Cambridge, MA"
+office <- "30 Wadsworth St, Cambridge, MA"
+
+ggmap::mapdist(pub, office, mode = "bicycling", output = "simple")
+```
+
+## Distance
+
+For the Euclidean / great-circle distance between points, `sf` provides `st_distance()`, which is the modern replacement for `sp::spDists()` and `geosphere::distHaversine()`. It returns a units-aware matrix.
+
+```{r}
+# arbitrary points
+fake.points <- st_as_sf(
+  data.frame(x = c(-144, -144.4, -144.4, -144.25),
+             y = c(70.3,  70,    70.3,   70)),
+  coords = c("x", "y"), crs = 4326
+)
+st_distance(fake.points)  # great-circle distance in meters, as a units matrix
+```
+
+You can convert units easily with the `units` package:
+
+```{r}
+set_units(st_distance(fake.points), "km")
+```
+
+### Point-to-polygon distance
+
+What about the distance from a point to a polygon, plus the polygon it is closest to? In the old workflow this was `geosphere::dist2Line()`. In `sf`, compute distances with `st_distance()` and locate the nearest polygon with `st_nearest_feature()`. To recover the *closest coordinate on the polygon boundary*, use `st_nearest_points()`.
+
+```{r}
+home <- places.geo %>%
+  filter(name == "Muddy Charles, Cambridge, MA") %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+# distance from `home` to every district
+d <- st_distance(home, boston)
+set_units(d[1, ], "km")
+
+# which district is closest?
+nearest.idx <- st_nearest_feature(home, boston)
+nearest.idx
+boston[nearest.idx, "DISTRICT"]
+
+# the actual closest point on the boundary
+near.line <- st_nearest_points(home, boston[nearest.idx, ])
+near.line
+```
+
+We can visualize the result as a map: shade the nearest district, plot the point of interest, and draw a line to the nearest point on the boundary.
+
+```{r}
+ggplot() +
+  geom_sf(data = boston, fill = "grey95", color = "grey60") +
+  geom_sf(data = boston[nearest.idx, ], fill = "purple", alpha = 0.4) +
+  geom_sf(data = near.line, color = "red") +
+  geom_sf(data = home, color = "blue", size = 2) +
+  theme_minimal()
+```
+
+# Spatial Data Analysis
+
+In this section we will introduce how to detect and deal with spatial dependence in regression models using spatial data.
+
+## Assessing Spatial Clustering
+
+To learn how to detect spatial autocorrelation, we will use one *informal* and one *formal* method. For this part we will use a new polygons dataset called `boston_n`, which includes neighborhood coordinates, unique IDs, and demographic variables from 2000.
+
+```{r}
+boston_n <- st_read(file.path("data", "BostonData", "Boston_N.shp"))
+head(st_drop_geometry(boston_n))
+plot(st_geometry(boston_n))
+```
+
+The question we are interested in is whether the share of Black and Hispanic population in a neighborhood (variable `blck_l_`) is associated with education attainment, measured as the percentage of people with at least a bachelor's degree (`mnmmbchlr`). Shapefile column names are often truncated; we'll rename them for clarity. With `sf`, the object behaves like a `data.frame`, so manipulation is straightforward.
+
+```{r}
+names(boston_n)
+names(boston_n)[7:8] <- c("minimumbachelor", "black_lat")
+```
+
+An informal approach to detecting spatial autocorrelation is to map the residuals of an OLS regression. If neighboring residuals are similar in size, there is likely spatial autocorrelation. We'll regress education on the share of Black and Hispanic population, store the residuals, and map them.
+
+```{r}
+my.model <- lm(minimumbachelor ~ black_lat, data = boston_n)
+summary(my.model)
+boston_n$resid_ols <- residuals(my.model)
+
+tm_shape(boston_n) +
+  tm_polygons("resid_ols",
+              style = "quantile",
+              n = 5,
+              palette = "Blues",
+              border.col = "grey",
+              title = "OLS Residuals Quantile") +
+  tm_layout(legend.position = c("left", "bottom"),
+            legend.text.size = 0.6)
+```
+
+Ideally the residuals would look randomly distributed across space. Instead, similar-sized residuals cluster together, suggesting unmodeled spatial structure.
+
+We can do more formal tests of spatial autocorrelation as well. To do this, we first build the spatial weights matrix that identifies which neighborhoods share edges. We use `poly2nb()` (which accepts an `sf` object directly in modern `spdep`) and convert to a row-standardized `listw` with `nb2listw()`.
+
+```{r}
+continuity.nb <- poly2nb(boston_n, queen = TRUE)
+summary(continuity.nb)
+
+# plot neighbor links over the polygons
+plot(st_geometry(boston_n), border = "grey")
+plot(continuity.nb,
+     coords = st_coordinates(suppressWarnings(st_centroid(boston_n))),
+     add = TRUE, col = "red")
+
+continuity.listw <- nb2listw(continuity.nb, style = "W", zero.policy = TRUE)
+summary(continuity.listw, zero.policy = TRUE)
+head(continuity.listw$weights)
+```
+
+One formal test of spatial dependence is Moran's I, computed with `moran.test()`. We can also visualize spatial autocorrelation with `moran.plot()`.
+
+```{r}
+moran.test(boston_n$minimumbachelor,
+           listw = continuity.listw,
+           zero.policy = TRUE,
+           adjust.n = TRUE)
+moran.plot(boston_n$minimumbachelor,
+           continuity.listw,
+           zero.policy = TRUE)
+```
+
+The statistic ranges from -1 to 1. A value near 1 indicates strong positive spatial autocorrelation.
+
+We can also calculate *local* Moran's I statistics for each polygon. For local Moran's I, use `localmoran()`.
+
+```{r}
+locmoran.boston_n <- localmoran(boston_n$minimumbachelor,
+                                continuity.listw,
+                                zero.policy = TRUE)
+head(locmoran.boston_n)
+boston_n <- cbind(boston_n, as.data.frame(locmoran.boston_n))
+```
+
+We can also map the Z scores from the local Moran's I output for a more formal picture of clustering.
+
+```{r}
+tm_shape(boston_n) +
+  tm_polygons("Z.Ii",
+              style = "quantile",
+              n = 5,
+              palette = "Blues",
+              border.col = "grey",
+              title = "Z Scores Quantile") +
+  tm_layout(legend.position = c("left", "bottom"),
+            legend.text.size = 0.6)
+```
+
+We can now see clear spatial dependence among neighborhoods.
+
+## Spatial Regression
+
+Now that we have detected spatial dependence, we can try to take it into account in our regression models. Spatial dependence in a regression setting can be modeled similarly to autocorrelation in time series. Spatial autocorrelation can be thought of in terms of non-zero correlation with the error term, similar to the presence of an endogenous variable. This implies that OLS estimates in the non-spatial model will be biased and inconsistent (Anselin and Bera, 1998).
+
+Spatial regression functions used to live in `spdep` but have moved to the `spatialreg` package. We estimate a spatial autoregressive (SAR) or spatial lag model with `spatialreg::lagsarlm()`. This model returns the $\rho$ parameter (the spatial autoregressive coefficient), its p-value, and lets us compare with standard OLS.
+
+```{r}
+my.model.sar <- lagsarlm(minimumbachelor ~ black_lat,
+                         data = boston_n,
+                         listw = continuity.listw,
+                         zero.policy = TRUE)
+summary(my.model.sar)
+```
+
+Now we can map the new residuals to see if the spatial model improves on the OLS residual pattern.
+
+```{r}
+boston_n$resid_sar <- residuals(my.model.sar)
+head(st_drop_geometry(boston_n))
+
+tm_shape(boston_n) +
+  tm_polygons("resid_sar",
+              style = "quantile",
+              n = 5,
+              palette = "Blues",
+              border.col = "grey",
+              title = "SAR Residuals Quantile") +
+  tm_layout(legend.position = c("left", "bottom"),
+            legend.text.size = 0.6)
+```
+
+It looks a bit better.
+
+There are many ways to model spatial autocorrelation. The SAR or spatial lag model above is analogous to a time-series lagged dependent variable model, where neighboring values play the role of past values. Another type, the *spatial error model*, models spatial correlation in the disturbance term -- analogous to serial autocorrelation in time series. We can implement this with `spatialreg::errorsarlm()`:
+
+```{r}
+my.model.ear <- errorsarlm(minimumbachelor ~ black_lat,
+                           data = boston_n,
+                           listw = continuity.listw,
+                           zero.policy = TRUE)
+summary(my.model.ear)
+```
+
+Another approach is to use spatial heteroskedasticity- and autocorrelation-robust (HAC) standard errors with OLS. The most commonly used estimator is from Conley (1999, 2008), which allows for serial correlation over time as well as spatial correlation among units within a given distance. Conley standard errors are easy to implement in Stata; in R, see the `conleyreg` or `lmtest`/`sandwich`-based implementations for current options.

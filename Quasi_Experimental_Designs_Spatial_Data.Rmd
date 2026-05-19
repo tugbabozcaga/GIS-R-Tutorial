@@ -1,0 +1,601 @@
+---
+title: "Quasi-Experimental Designs Using Spatial Data"
+author: "Tuğba Bozçağa"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    df_print: paged
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5,
+  cache = FALSE
+)
+```
+
+> *This tutorial is taught at the Mannheim Political Methodology Summer School. It is a companion to the GIS-in-R workshop and assumes familiarity with the `sf` package and basic causal inference.*
+
+# Introduction
+
+Political scientists rarely care about spatial data for its own sake. We care because the units we study (countries, districts, villages, polling stations) are arranged in space, and that arrangement carries information about the **assignment of treatment** and the **plausibility of identification**. A border between two regimes can serve as a discontinuity. A policy that applies in some districts but not others creates a quasi-experiment, but only if treatment does not bleed across the line. A study that ignores geography risks both confounding (omitted spatial factors that drive both treatment and outcome) and SUTVA violations (units near the treated are themselves partially treated).
+
+This tutorial is therefore **not** a generic spatial econometrics primer. The goal is to walk through four quasi-experimental designs that political methodologists actually run with spatial data: geographic regression discontinuity (GRD), spatial difference-in-differences, matching on geographic covariates, and using spatial regression as a *robustness check*. For each design we show, in code you can copy, how to implement it and diagnose its credibility.
+
+A guiding principle throughout: spatial econometrics models (SAR, SEM, SDM) are **diagnostic tools**, not causal estimators. The current standard in political methodology (see, e.g., Betz, Cook & Hollenbach; Cook, Hays & Franzese) is to use a design (RDD, DiD, matching, IV) for identification, and to deploy spatial models to probe whether the estimate is robust to plausible spatial dependence. Students should resist the temptation to report a SAR or SDM coefficient as "the effect."
+
+# Packages and simulated data
+
+We use a modern stack: `sf` for vector geometries, `spdep` and `spatialreg` for weight matrices and spatial models, `fixest` for two-way fixed-effects DiD, `MatchIt` for matching, and `rdrobust` for the geographic RDD (optional; we also show a hand-rolled local linear estimator).
+
+```{r packages}
+library(sf)
+library(spdep)
+library(spatialreg)
+library(fixest)
+library(MatchIt)
+library(rdrobust)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(broom)
+```
+
+## Simulating a study region
+
+We build a `30 × 30` grid of municipalities. A vertical "border" at $x = 15$ separates a treated region (left half) from a control region (right half). The outcome depends on (a) the treatment, (b) a smooth latitudinal gradient $f(y)$ representing an omitted geographic confounder, (c) spatial autocorrelation, and (d) noise. We also generate a pre-treatment period for the DiD section.
+
+```{r simulate}
+set.seed(20240519)
+
+# 30 x 30 grid -> 900 cells; trim to a circle-ish region for visual variety
+grid <- st_make_grid(
+  st_polygon(list(rbind(c(0, 0), c(30, 0), c(30, 30), c(0, 30), c(0, 0)))),
+  cellsize = 1.5
+) |> st_sf(geometry = _)
+
+grid$id  <- seq_len(nrow(grid))
+ctr      <- st_coordinates(st_centroid(grid))
+grid$x   <- ctr[, 1]
+grid$y   <- ctr[, 2]
+grid$dx  <- grid$x - 15            # signed distance to the vertical border (km)
+grid$treat <- as.integer(grid$dx < 0)  # left of border = treated
+
+# Spatial autocorrelation via an exponential covariance kernel
+D <- as.matrix(dist(ctr))
+Sigma <- exp(-D / 4)               # range ~4 km
+u <- as.numeric(t(chol(Sigma + diag(1e-4, nrow(D)))) %*% rnorm(nrow(D)))
+
+# Outcome: treatment effect (+2), smooth gradient in y (confounder),
+# spatial AC, and i.i.d. noise. Same gradient on both sides of the border.
+beta_tau <- 2
+grid$y0  <- 0.05 * (grid$y - 15)^2 / 5 + 1.5 * u + rnorm(nrow(grid), sd = 1)
+grid$y1  <- grid$y0 + beta_tau
+grid$Y   <- ifelse(grid$treat == 1, grid$y1, grid$y0)
+
+# Pre-period (no treatment effect anywhere) and post-period (treatment kicks in on left)
+grid$Y_pre  <- 0.05 * (grid$y - 15)^2 / 5 + 1.5 * u + rnorm(nrow(grid), sd = 1)
+grid$Y_post <- grid$Y
+
+cat("N units:", nrow(grid),
+    "  Treated:", sum(grid$treat),
+    "  Control:", sum(1 - grid$treat), "\n")
+```
+
+A quick map to confirm the setup:
+
+```{r map-setup, fig.height = 4}
+ggplot(grid) +
+  geom_sf(aes(fill = Y), color = NA) +
+  geom_vline(xintercept = 15, color = "white", linewidth = 1, linetype = 2) +
+  scale_fill_viridis_c(option = "C") +
+  labs(title = "Simulated outcome Y", subtitle = "Dashed line: treatment border (left = treated)") +
+  theme_minimal()
+```
+
+Notice the latitudinal gradient (top and bottom are higher than the middle); this is the confounder a naive cross-sectional comparison would absorb. The treatment effect adds a constant shift to the left half.
+
+# 1. Why "spatial" matters for causal inference
+
+Two issues motivate everything that follows.
+
+## 1.1 Spatial autocorrelation as a SUTVA violation
+
+SUTVA (the Stable Unit Treatment Value Assumption) requires that the potential outcome of unit $i$ depends only on $i$'s own treatment, not on the treatment of any other unit. In spatially structured settings this is often violated:
+
+- A district receives a job-training program; workers in neighboring districts benefit through commuting and labor-market spillovers.
+- A village gets a new road; trade increases for neighbors as well.
+- An anti-corruption campaign in one province deters corruption in adjacent provinces by signaling enforcement.
+- A get-out-the-vote campaign in one precinct boosts turnout next door through social-network contact.
+
+When spillovers go in the same direction as the treatment effect, **comparing treated to "spatially close" controls understates the effect**; comparing to faraway controls may pick up other geographic differences. There is no free lunch; the methodological question is how to make the trade-off transparent.
+
+Choice of neighbor structure matters. Two units can be "neighbors" because they share a border (queen/rook contiguity), because they are within some distance threshold, or because they are among each other's $k$ nearest neighbors. The choice should reflect a theoretical claim about how spillover propagates: information networks suggest $k$-nearest, commuting suggests distance bands, regulatory interactions suggest contiguity. Report sensitivity to alternative weight matrices.
+
+```{r weights-construction}
+# Three neighbor definitions, for the same units.
+ctr_pts <- st_coordinates(st_centroid(grid))
+
+# (a) Queen contiguity on the polygon grid
+nb_queen <- poly2nb(grid, queen = TRUE)
+
+# (b) k = 4 nearest neighbors
+nb_knn4  <- knn2nb(knearneigh(ctr_pts, k = 4))
+
+# (c) Distance threshold of 3 km
+nb_d3    <- dnearneigh(ctr_pts, d1 = 0, d2 = 3)
+
+# Row-standardized weight matrices
+lw       <- nb2listw(nb_queen, style = "W", zero.policy = TRUE)
+lw_knn4  <- nb2listw(nb_knn4,  style = "W", zero.policy = TRUE)
+lw_d3    <- nb2listw(nb_d3,    style = "W", zero.policy = TRUE)
+
+# Quick descriptive: average number of neighbors per unit
+sapply(list(queen = nb_queen, knn4 = nb_knn4, dist3 = nb_d3),
+       function(nbi) mean(card(nbi)))
+```
+
+Moran's I gives a single global summary of spatial autocorrelation:
+
+```{r moran-outcomes}
+moran.test(grid$Y, lw, zero.policy = TRUE)
+```
+
+Moran's I on the raw outcome is far from zero, but most of that comes from the latitudinal confounder, not from a treatment spillover per se. The interesting test is on **residuals from your causal model**; we return to this in Sections 3 and 5. A useful complement is the Moran scatterplot, which visualizes each unit's value against the average of its neighbors':
+
+```{r moran-scatter, fig.height = 4}
+moran.plot(grid$Y, lw, zero.policy = TRUE,
+           xlab = "Y", ylab = "Spatially lagged Y",
+           main = "Moran scatterplot of the outcome")
+```
+
+Points in the upper-right and lower-left quadrants are spatial clusters of high-high and low-low values; off-diagonal points are spatial outliers.
+
+## 1.2 Spatial confounding
+
+Spatial confounding occurs when an unmeasured variable that varies smoothly across space is correlated with both treatment and outcome. In our simulation this is the latitudinal gradient. A naive OLS comparing the two halves of the map will (by symmetry of our setup) recover roughly the correct effect, but in any real application, where treatment status is not assigned by a clean vertical cut, geography will be confounded with history, ethnicity, economic structure, and so on. Think of regimes that were historically separated by a now-defunct border, ethnic groups whose territory roughly aligns with administrative units, or climate zones that determine both agricultural policy and economic outcomes.
+
+The methodological responses are:
+
+1. **Condition on geography directly.** RDD effectively conditions on location at the boundary; matching can include spatial covariates.
+2. **Difference geography out.** DiD with unit fixed effects sweeps out time-invariant spatial confounding.
+3. **Model the spatial dependence as a robustness check.** SAR/SEM specifications let you ask whether your causal estimate survives plausible spatial structure in the error term.
+
+```{r naive-ols}
+# Naive cross-sectional OLS: badly misleading in general, but useful as a baseline.
+ols_naive <- lm(Y ~ treat, data = grid)
+summary(ols_naive)$coefficients
+```
+
+The estimate is biased upward or downward depending on which side has more of the gradient, and the standard errors are too small because of spatial autocorrelation. Conventional OLS treats each grid cell as an independent draw, but neighboring cells share unobserved drivers; the *effective* number of independent observations is far smaller than $N$. We need a design.
+
+# 2. Geographic regression discontinuity
+
+The geographic RD design (Keele & Titiunik, 2015; Dell, 2010) exploits a sharp boundary in space across which treatment changes discontinuously but potential outcomes are assumed continuous. The canonical example is Dell's (2010) study of the Peruvian *mita*: a colonial forced-labor system that applied in some districts but not in others, with a sharp administrative boundary. Comparing villages just inside the mita boundary to villages just outside, Dell isolates the long-run economic effect of the institution.
+
+## 2.1 Identifying assumption
+
+Let $D_i \in \{0, 1\}$ denote treatment and $b(s_i)$ the signed distance from unit $i$'s location $s_i$ to the boundary, with $b < 0$ on the treated side. The identifying assumption is:
+
+$$
+\lim_{b \uparrow 0} \mathbb{E}[Y(0) \mid b(s) = b] = \lim_{b \downarrow 0} \mathbb{E}[Y(0) \mid b(s) = b]
+$$
+
+That is: **expected potential outcomes are continuous at the boundary**. Anything that jumps at the boundary (ethnicity, prior institutions, climate) threatens identification. In our simulation the latitudinal gradient is, by construction, continuous across the border, so the design works.
+
+## 2.2 Computing signed distance to the border
+
+In our setup the border is vertical at $x = 15$, so signed distance is simply `dx = x - 15` (already computed). In real applications you'd compute distance to a `sfc_LINESTRING` representing the border and add the sign:
+
+```{r border-distance-real, eval = FALSE}
+# Illustrative; not run, since our simulation has a trivial vertical border.
+border_line <- st_sfc(st_linestring(rbind(c(15, 0), c(15, 30))), crs = st_crs(grid))
+dist_to_border <- as.numeric(st_distance(st_centroid(grid), border_line))
+side_sign <- ifelse(grid$treat == 1, -1, 1)
+grid$dx_real <- side_sign * dist_to_border
+```
+
+The chunk above is marked `eval = FALSE` because for the simulated vertical border, `dx` is exact and `st_distance` would just reproduce it (with a bit of floating-point noise). Use this pattern with a real `LINESTRING` border in applied work.
+
+## 2.3 Local linear regression with a triangular kernel
+
+The workhorse GRD estimator is a local linear regression on each side of the border, weighted by a kernel that decays as you move away from the cutoff. We first do it by hand for transparency, then with `rdrobust`.
+
+```{r grd-handrolled}
+# Hand-rolled local linear estimator at the cutoff with a triangular kernel.
+local_linear_rd <- function(d, y, treat, bw, kernel = "triangular") {
+  in_band <- abs(d) <= bw
+  d_b <- d[in_band]; y_b <- y[in_band]; t_b <- treat[in_band]
+  w <- if (kernel == "triangular") pmax(0, 1 - abs(d_b) / bw) else rep(1, length(d_b))
+  # Interact distance with treatment so slopes differ on each side
+  fit <- lm(y_b ~ t_b * d_b, weights = w)
+  list(
+    tau = unname(coef(fit)["t_b"]),
+    se  = unname(sqrt(diag(vcov(fit)))["t_b"]),
+    n   = sum(in_band)
+  )
+}
+
+# Pick a moderate bandwidth in km
+bw_pick <- 5
+rd_hand <- local_linear_rd(grid$dx, grid$Y, grid$treat, bw = bw_pick)
+rd_hand
+```
+
+The hand-rolled estimate of `tau` should be near the true effect of `2`. Note that the standard error here is **not** spatial-cluster-robust; for publication you would want Conley (1999) standard errors or clustering at the boundary segment. See the `conleyreg` package, or `fixest::feols(..., vcov = conley(cutoff = ...))`.
+
+```{r grd-conley}
+# Conley SEs via fixest. Cutoff in same units as coordinates (km here).
+grd_data <- grid |>
+  st_drop_geometry() |>
+  mutate(weight_tri = pmax(0, 1 - abs(dx) / bw_pick)) |>
+  filter(abs(dx) <= bw_pick)
+
+# Attach coordinates back for Conley SE
+grd_data$lon <- grid$x[grid$id %in% grd_data$id]
+grd_data$lat <- grid$y[grid$id %in% grd_data$id]
+
+fit_conley <- feols(
+  Y ~ treat * dx,
+  data    = grd_data,
+  weights = ~ weight_tri,
+  vcov    = conley(cutoff = 3, distance = "spherical")
+)
+summary(fit_conley)
+```
+
+(Conley SEs assume coordinates are lon/lat in degrees; with planar simulated coordinates the magnitude is illustrative. In real work, project to a planar CRS and use `distance = "triangular"` or rescale the cutoff.)
+
+## 2.4 The `rdrobust` workflow
+
+`rdrobust` provides MSE-optimal bandwidth selection (Calonico, Cattaneo & Titiunik) and bias-corrected confidence intervals.
+
+```{r grd-rdrobust}
+rd_fit <- rdrobust(y = grid$Y, x = grid$dx, c = 0, kernel = "triangular")
+summary(rd_fit)
+```
+
+The "Conventional" estimate is the usual local-linear coefficient; the "Robust" estimate corrects for bias from the polynomial approximation and is what most referees now expect. Compare it to the true treatment effect of $2$.
+
+## 2.5 Visualizing the discontinuity
+
+Before any formal estimation, plot the data. A scatter of $Y$ against signed distance to the border with a local-polynomial smoother on each side is the single most useful diagnostic for a geographic RD: a visible jump at zero is the design's signature, and its absence is reason to reconsider.
+
+```{r grd-plot, fig.height = 4}
+ggplot(grid, aes(dx, Y, color = factor(treat))) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(aes(group = treat), method = "loess", se = TRUE) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  scale_color_manual(values = c("0" = "gray40", "1" = "steelblue"),
+                     labels = c("Control", "Treated"), name = NULL) +
+  labs(x = "Signed distance to border (km)", y = "Outcome Y",
+       title = "RD plot: outcome vs. running variable") +
+  theme_minimal()
+```
+
+The vertical gap between the two smoothers at $d_x = 0$ is, visually, your RD estimate.
+
+## 2.6 Diagnostics
+
+Three diagnostics every geographic RD should report.
+
+### Bandwidth sensitivity
+
+```{r grd-bw-sensitivity, fig.height = 4}
+bws <- seq(2, 10, by = 1)
+sens <- vapply(bws, function(b) {
+  r <- local_linear_rd(grid$dx, grid$Y, grid$treat, bw = b)
+  c(b = b, tau = r$tau, se = r$se)
+}, numeric(3)) |> t() |> as.data.frame()
+
+ggplot(sens, aes(b, tau)) +
+  geom_ribbon(aes(ymin = tau - 1.96 * se, ymax = tau + 1.96 * se), alpha = 0.2) +
+  geom_line() + geom_point() +
+  geom_hline(yintercept = beta_tau, linetype = 2, color = "red") +
+  labs(x = "Bandwidth (km)", y = "Estimated effect",
+       title = "Sensitivity of RD estimate to bandwidth",
+       subtitle = "Red dashed line = true effect") +
+  theme_minimal()
+```
+
+The estimate should be flat in a neighborhood of the optimal bandwidth. Sharp drift suggests the polynomial approximation is doing too much work.
+
+### McCrary-style density test
+
+Manipulation of the running variable would show up as a discontinuity in the density of $d_x$ at zero. With administrative borders this is rarely a concern, but it's still worth checking, e.g., that population mass isn't strangely sparse on one side.
+
+```{r mccrary, fig.height = 4}
+# Simple visual density check; for a formal test use rddensity::rddensity()
+ggplot(grid, aes(dx)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, color = "red", linetype = 2) +
+  labs(x = "Distance to border (km)", title = "Density of the running variable") +
+  theme_minimal()
+```
+
+### Balance on pre-treatment covariates
+
+If covariates that *cannot* be affected by treatment (geography, baseline demographics) jump at the boundary, the continuity assumption is suspect. Run an RD on each one and report the table.
+
+```{r grd-balance}
+# Pre-period outcome plays the role of a placebo covariate here.
+rd_balance <- rdrobust(y = grid$Y_pre, x = grid$dx, c = 0, kernel = "triangular")
+data.frame(
+  outcome  = "Y_pre (placebo)",
+  estimate = rd_balance$Estimate[1],
+  pval     = rd_balance$pv[3]   # robust p-value
+)
+```
+
+A small, insignificant placebo effect supports the design. A large one is a red flag.
+
+### A caveat about the "border" itself
+
+In two-dimensional space, a "boundary" is not a scalar; it is a curve. Two units the same distance from the border can be at very different points along it, with different local conditions on the other side. Keele & Titiunik (2015) emphasize this: a defensible geographic RD requires either (a) a homogeneous border (think a flat geometric line through homogeneous terrain) or (b) explicit conditioning on location along the border. In practice, a common solution is to add **boundary segment fixed effects** or to interact the running variable with location along the boundary. We do not do this here because our simulated border is trivially homogeneous, but in applied work this is a non-trivial modeling choice.
+
+# 3. Spatial difference-in-differences
+
+When treatment is assigned to some geographic units at some time, the standard tool is two-way fixed-effects DiD:
+
+$$
+Y_{it} = \alpha_i + \gamma_t + \tau \cdot (D_i \cdot \text{Post}_t) + \varepsilon_{it}.
+$$
+
+The unit fixed effects $\alpha_i$ absorb the spatial confounder we worried about in Section 1, and time fixed effects $\gamma_t$ absorb common shocks. With two periods (pre, post) and a time-invariant treatment, this collapses to a comparison of changes.
+
+## 3.1 Setting up the panel
+
+```{r did-panel}
+panel <- grid |>
+  st_drop_geometry() |>
+  select(id, x, y, dx, treat, Y_pre, Y_post) |>
+  pivot_longer(cols = c(Y_pre, Y_post),
+               names_to = "period", values_to = "Y") |>
+  mutate(post = as.integer(period == "Y_post"),
+         did  = treat * post)
+
+head(panel)
+```
+
+## 3.2 The DiD estimate
+
+```{r did-twfe}
+did_fit <- feols(Y ~ did | id + period, data = panel)
+summary(did_fit)
+```
+
+The point estimate should be close to the true treatment effect (2). Standard errors are clustered at the unit by default with `feols` when fixed effects are present.
+
+## 3.3 SUTVA threat: testing for spatial spillovers
+
+The DiD logic assumes that control units' pre-to-post changes capture the counterfactual trend for treated units. If treated and control units are spatially proximate and treatment spills over, controls are partially treated and the estimate is biased toward zero (assuming positive spillovers).
+
+The first diagnostic: **Moran's I on the residuals**. Residual spatial autocorrelation suggests something spatial is still in the error term, either unmodeled confounding or spillovers.
+
+```{r did-moran-resid}
+panel$resid <- residuals(did_fit)
+
+# Test residual autocorrelation in the post period only
+post_resid <- panel$resid[panel$post == 1]
+moran.test(post_resid, lw, zero.policy = TRUE)
+```
+
+In our simulation the residuals should be roughly white: the unit fixed effects swept out the spatial confounder. In applied work, a significant Moran's I should prompt you to consider rings or donuts and to report a SAR or SEM robustness check (Section 5).
+
+## 3.4 Donut DiD: dropping units near the boundary
+
+If spillovers extend, say, 3 km, the cleanest robustness check is to drop the units within 3 km of the boundary on both sides. The remaining sample compares "deeply treated" to "untreated by spillover" units.
+
+```{r did-donut}
+donut_radius <- 3
+panel_donut  <- filter(panel, abs(dx) > donut_radius)
+
+did_donut <- feols(Y ~ did | id + period, data = panel_donut)
+
+bind_rows(
+  data.frame(spec = "Full sample",      est = coef(did_fit)["did"],   se = se(did_fit)["did"]),
+  data.frame(spec = "Donut (>3 km)",   est = coef(did_donut)["did"], se = se(did_donut)["did"])
+)
+```
+
+If the donut estimate is materially larger than the full-sample estimate, spillovers were attenuating the full-sample effect.
+
+### A note on standard errors with spatial dependence
+
+The default clustered SEs from `feols` cluster on the unit dimension, which handles serial correlation within a unit over time but **not** spatial correlation across units. With many time periods and spatial dependence, you may want:
+
+- **Conley (1999) SEs**, which allow correlation that decays with distance, implemented in `fixest::feols(..., vcov = conley(cutoff = ...))` or in the `conleyreg` package.
+- **Two-way clustering** on unit and on a coarser spatial unit (e.g., region), via `vcov = ~ id + region`.
+
+Spatial dependence does not bias the point estimate, but it can severely understate uncertainty.
+
+## 3.5 Ring DiD: spillovers as treatment intensities
+
+A more informative version assigns control units to concentric rings around the treated region and estimates a separate effect for each ring. The treatment effect is the coefficient on "deep treatment" (far inside the boundary); the ring coefficients trace the spillover decay.
+
+```{r did-rings}
+panel_rings <- panel |>
+  mutate(zone = case_when(
+    dx < -3            ~ "treated_deep",
+    dx >= -3 & dx < 0  ~ "treated_near",
+    dx >= 0  & dx < 3  ~ "control_near",
+    dx >= 3            ~ "control_far"
+  ),
+  zone = factor(zone, levels = c("control_far", "control_near",
+                                 "treated_near", "treated_deep")))
+
+ring_fit <- feols(Y ~ i(zone, post, ref = "control_far") | id + period,
+                  data = panel_rings)
+summary(ring_fit)
+```
+
+Reading the coefficients: each is the differential pre-to-post change in that zone relative to "control_far." If "control_near" picks up a positive effect, that's a spillover; the "treated_deep" coefficient is your spillover-adjusted treatment effect.
+
+You can visualize the ring estimates as a function of distance to the border:
+
+```{r ring-plot, fig.height = 4}
+ring_coefs <- broom::tidy(ring_fit, conf.int = TRUE) |>
+  mutate(zone = gsub("zone::|:post", "", term)) |>
+  filter(grepl("post", term))
+
+ggplot(ring_coefs, aes(zone, estimate)) +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high)) +
+  geom_hline(yintercept = 0, linetype = 2, color = "red") +
+  labs(x = "Zone (ordered from control to deeply treated)",
+       y = "Estimated effect vs. control_far",
+       title = "Ring DiD: distance-by-time interactions") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+# 4. Matching with spatial covariates
+
+When neither RDD (no sharp boundary) nor DiD (no clean pre-period) is available, geographic matching offers a third route. The idea: match each treated unit to a control unit that is similar on observables **including geographic location**, then compare outcomes.
+
+The danger to avoid is matching units that are *too close*: if treatment spills over, your matched control is partially treated and your estimate is biased toward zero. Use a **caliper** to require a minimum geographic distance, while still controlling for non-geographic confounders.
+
+```{r matching}
+match_data <- grid |>
+  st_drop_geometry() |>
+  mutate(latitude = y) |>
+  select(id, treat, Y, x, y, latitude)
+
+# Nearest-neighbor match on latitude (the geographic confounder) only.
+# In real applications, include socioeconomic covariates as well.
+m_out <- matchit(
+  treat ~ latitude,
+  data    = match_data,
+  method  = "nearest",
+  distance = "mahalanobis"
+)
+matched <- match.data(m_out)
+
+# Estimate ATT on the matched sample
+att_match <- lm(Y ~ treat, data = matched, weights = weights)
+summary(att_match)$coefficients
+```
+
+To add a **geographic caliper that excludes near-neighbors** (i.e., enforce a minimum distance between matched treated and control to mitigate spillovers), you can post-process the match:
+
+```{r matching-caliper}
+# For each matched pair, drop pairs that are within `min_dist` km
+min_dist <- 3
+pairs    <- m_out$match.matrix          # rows = treated, entries = control ids
+treated_ids <- as.integer(rownames(pairs))
+control_ids <- as.integer(pairs[, 1])
+
+dist_pair <- sqrt(
+  (match_data$x[treated_ids] - match_data$x[control_ids])^2 +
+  (match_data$y[treated_ids] - match_data$y[control_ids])^2
+)
+
+keep <- which(dist_pair > min_dist)
+matched_far <- bind_rows(
+  match_data[treated_ids[keep], ],
+  match_data[control_ids[keep], ]
+)
+
+att_far <- lm(Y ~ treat, data = matched_far)
+summary(att_far)$coefficients
+```
+
+### Inspecting balance
+
+Always inspect balance after matching. The point of matching is to make treated and control units comparable on the covariates you included.
+
+```{r match-balance}
+summary(m_out, un = FALSE)
+```
+
+Standardized mean differences should generally be below 0.1 in absolute value. If matching fails to balance a covariate, that's a sign you need a different specification (different distance metric, more covariates, exact matching on key variables) or that overlap is insufficient.
+
+A brief note on **synthetic control**: when only one or a few units are treated, synthetic control (`Synth`, `tidysynth`, `augsynth`) constructs a weighted combination of donors that resembles the treated unit on pre-treatment outcomes. With spatial data you can restrict the donor pool to nearby (or, depending on the threat model, *far away*) units to manage geographic similarity vs. spillover concerns. We don't run synthetic control here because the canonical case is one treated unit, but the geographic restriction logic carries over.
+
+### When matching is *not* the right answer
+
+A frequent mistake is to use matching when the underlying threat is unobserved spatial confounding. Matching only handles *observed* covariates; if the true confounder is unmeasured and varies smoothly in space, matching on observed geographic location can do more harm than good (by closing some good comparisons while leaving the confounding open). Geographic matching is most defensible when (a) you have a rich set of observed covariates, (b) the treatment assignment mechanism is plausibly conditional on those covariates, and (c) you treat geographic distance as a covariate among others, not as a substitute for identification.
+
+# 5. Spatial regression as a robustness check
+
+If your causal estimate from RDD, DiD, or matching is sensitive to assumptions about the spatial structure of the error, you have a problem. Spatial autoregressive (SAR) and spatial error (SEM) models, fit on the same data, let you check this. These are not the primary causal estimator; they are a robustness exercise.
+
+The SAR model adds a spatially lagged outcome:
+$$
+Y = \rho W Y + X\beta + \varepsilon
+$$
+
+The SEM model puts spatial dependence in the error term:
+$$
+Y = X\beta + u, \quad u = \lambda W u + \varepsilon
+$$
+
+```{r spatial-robustness}
+# Fit OLS, SAR, SEM with the same design matrix
+ols_fit <- lm(Y ~ treat + y, data = grid)
+sar_fit <- lagsarlm(Y ~ treat + y, data = grid, listw = lw, zero.policy = TRUE)
+sem_fit <- errorsarlm(Y ~ treat + y, data = grid, listw = lw, zero.policy = TRUE)
+
+# Side-by-side coefficients on the causal variable
+out <- data.frame(
+  model    = c("OLS", "SAR", "SEM"),
+  estimate = c(coef(ols_fit)["treat"],
+               coef(sar_fit)["treat"],
+               coef(sem_fit)["treat"]),
+  se = c(sqrt(diag(vcov(ols_fit)))["treat"],
+         sqrt(diag(vcov(sar_fit)))["treat"],
+         sqrt(diag(vcov(sem_fit)))["treat"])
+)
+out
+```
+
+Two interpretive points:
+
+1. **Read the SAR/SEM coefficient as a sensitivity check.** If all three estimators agree on the sign and rough magnitude of the treatment effect, that's evidence your causal finding is not an artifact of unmodeled spatial dependence. If they disagree wildly, dig in: probably your design is being held up by a spatial pattern in the residuals.
+2. **In SAR, the coefficient on `treat` is not the total effect.** Because the lagged outcome propagates, the total effect includes spillovers through $W$. Use `impacts()` to get direct, indirect, and total effects:
+
+```{r sar-impacts}
+sar_impacts <- impacts(sar_fit, listw = lw, R = 200)
+summary(sar_impacts, zstats = TRUE)
+```
+
+This is precisely why SAR should not be the primary estimator in causal applications: the coefficient you would want to interpret is conditional on a network propagation model that you usually do not believe literally. As a robustness check, however, it is informative: a small total SAR effect when your DiD effect is large should make you re-examine the DiD assumptions.
+
+# 6. A workflow summary for political methodologists
+
+A reasonable workflow for a paper that uses geography for identification:
+
+1. **Map your data first.** Plot treatment status and the outcome. Look for spatial patterns the design needs to handle.
+2. **Choose a design driven by treatment assignment**, not by what's fashionable. Sharp administrative border → GRD. Policy roll-out → DiD. Selection on observables that vary smoothly in space → matching with a geographic caliper.
+3. **Build the relevant geographic variable in `sf`.** Signed distance to a border, neighbor list, ring indicators.
+4. **Run your causal estimator** with appropriate standard errors (cluster on a meaningful unit, or use Conley SEs for continuous spatial dependence).
+5. **Diagnose SUTVA violations.** Moran's I on residuals; donut and ring specifications.
+6. **Test the design assumption.** Balance/placebo for RDD, parallel trends/event study for DiD, balance tables for matching.
+7. **Robustness with spatial regression.** Re-fit OLS, SAR, SEM. Are the conclusions stable?
+8. **Report uncertainty honestly.** Show bandwidth sensitivity, donut radius sensitivity, alternative weight matrices.
+
+The point of the spatial-econometrics toolbox in modern political methodology is not to be the showcase; it is to provide diagnostics and robustness for a design-based estimate.
+
+# References (informal)
+
+- Conley, T. G. (1999). GMM estimation with cross sectional dependence. *Journal of Econometrics*.
+- Dell, M. (2010). The persistent effects of Peru's mining mita. *Econometrica*.
+- Keele, L. & Titiunik, R. (2015). Geographic boundaries as regression discontinuities. *Political Analysis*.
+- Calonico, S., Cattaneo, M. D. & Titiunik, R. (2014). Robust nonparametric confidence intervals for regression-discontinuity designs. *Econometrica*.
+- Betz, T., Cook, S. J. & Hollenbach, F. M. (2020). Spatial interdependence and instrumental variable models. *Political Science Research and Methods*.
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
