@@ -25,7 +25,7 @@ knitr::opts_chunk$set(
 )
 ```
 
-> *This tutorial is taught at the Mannheim Political Methodology Summer School. It is a companion to the GIS-in-R workshop and assumes familiarity with the `sf` package and basic causal inference.*
+> *This tutorial is a companion to the GIS-in-R workshop and assumes familiarity with the `sf` package and basic causal inference.*
 
 # Introduction
 
