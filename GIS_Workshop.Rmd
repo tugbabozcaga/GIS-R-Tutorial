@@ -235,7 +235,7 @@ If you only need the index of the intersecting polygon (analogous to the old `ov
 
 ```{r}
 intersections <- st_intersects(boston.graf, boston)
-head(intersections)
+intersections[1:5]
 ```
 
 # Making Maps
@@ -394,10 +394,10 @@ base_t +
 Geocoding is the process of converting addresses or place names into latitude/longitude coordinates. The modern, key-free option is `tidygeocoder::geocode()`, which by default uses OpenStreetMap's Nominatim service.
 
 ```{r}
-places <- tibble(name = c("Muddy Charles, Cambridge, MA",
+places <- tibble(name = c("Harvard Square, Cambridge, MA",
                           "30 Wadsworth St, Cambridge, MA"))
 places.geo <- places %>%
-  geocode(address = name, method = "osm", lat = lat, long = lon)
+  tidygeocoder::geocode(address = name, method = "osm", lat = lat, long = lon)
 places.geo
 ```
 
@@ -405,15 +405,15 @@ You can also reverse-geocode -- ask for an address given a coordinate -- using `
 
 ```{r}
 places.geo %>%
-  reverse_geocode(lat = lat, long = lon, method = "osm",
-                  address = matched_address)
+  tidygeocoder::reverse_geocode(lat = lat, long = lon, method = "osm",
+                                address = matched_address)
 ```
 
 For finer-grained results (e.g. Google's `loctype` precision categories, or driving-time/distance queries), you can still use the Google Maps API through `ggmap::geocode()` / `ggmap::mapdist()`. These require a Google API key. The example below is left as `eval = FALSE`; set `GOOGLE_MAPS_API_KEY` in your `.Renviron` and call `ggmap::register_google(key = Sys.getenv("GOOGLE_MAPS_API_KEY"))` to enable it.
 
 ```{r eval = FALSE}
 # ggmap::register_google(key = Sys.getenv("GOOGLE_MAPS_API_KEY"))
-pub    <- "Muddy Charles, Cambridge, MA"
+pub    <- "Harvard Square, Cambridge, MA"
 office <- "30 Wadsworth St, Cambridge, MA"
 
 ggmap::mapdist(pub, office, mode = "bicycling", output = "simple")
@@ -445,7 +445,7 @@ What about the distance from a point to a polygon, plus the polygon it is closes
 
 ```{r}
 home <- places.geo %>%
-  filter(name == "Muddy Charles, Cambridge, MA") %>%
+  filter(name == "Harvard Square, Cambridge, MA") %>%
   st_as_sf(coords = c("lon", "lat"), crs = 4326)
 
 # distance from `home` to every district
@@ -483,6 +483,7 @@ To learn how to detect spatial autocorrelation, we will use one *informal* and o
 
 ```{r}
 boston_n <- st_read(file.path("data", "BostonData", "Boston_N.shp"))
+boston_n <- st_make_valid(boston_n)
 head(st_drop_geometry(boston_n))
 plot(st_geometry(boston_n))
 ```
